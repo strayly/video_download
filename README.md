@@ -16,7 +16,7 @@ ffmpeg（用于音视频合并和视频播放）
 ## 运行
 python main.py
 
-依赖许可证
+## 依赖许可证
 PySide6: LGPL
 Playwright: MIT
 yt-dlp: Unlicense
