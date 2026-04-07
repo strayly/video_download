@@ -13,6 +13,9 @@ playwright install chromium
 ffmpeg（用于音视频合并和视频播放）
 有些站点设置了 Cookie验证可以手动设置 Cookie
 
+## 运行
+python main.py
+
 依赖许可证
 PySide6: LGPL
 Playwright: MIT
