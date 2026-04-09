@@ -24,11 +24,9 @@ from urllib.parse import urlparse
 import logging
 
 
-# ==================== 解决 Qt + Playwright 冲突（必须加在这里）====================
-#os.environ["QT_QPA_PLATFORM"] = "windows"
-#os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "0"
 
-# ====================== 日志系统（自动输出到控制台 + 文件）======================
+
+# ====================== 日志系统======================
 def setup_logger():
     log_dir = "logs"
     if not os.path.exists(log_dir):
