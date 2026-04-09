@@ -1,10 +1,14 @@
 import asyncio
+import time
 from datetime import datetime
 import shutil
 import sys
 import os
 from playwright.async_api import async_playwright
 import subprocess
+
+from playwright.sync_api import sync_playwright
+
 import yt_dlp
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -14,9 +18,36 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QAction
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtCore import Qt, QThread, Signal, QUrl, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QUrl, QSize, QtMsgType,qInstallMessageHandler
 import requests
 from urllib.parse import urlparse
+import logging
+
+
+# ==================== 解决 Qt + Playwright 冲突（必须加在这里）====================
+#os.environ["QT_QPA_PLATFORM"] = "windows"
+#os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "0"
+
+# ====================== 日志系统（自动输出到控制台 + 文件）======================
+def setup_logger():
+    log_dir = "logs"
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    log_file = os.path.join(log_dir, f"run_{datetime.now().strftime('%Y%m%d')}.log")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+setup_logger()
+log = logging.getLogger(__name__)
+
 # 创建cookie文件夹（如果不存在）
 COOKIE_DIR = os.path.join(os.getcwd(), "cookie")
 if not os.path.exists(COOKIE_DIR):
@@ -69,6 +100,7 @@ def read_cookie_from_folder(url, cookie_folder="cookie"):
                 continue
 
     return cookie_content
+
 # ====================== 下载线程 ======================
 class DownloadThread(QThread):
     progress_update = Signal(str, int)  # 文件名, 进度
@@ -180,7 +212,6 @@ class PWDownloadThread(QThread):
 
             # ====================== 【粘贴这里：加载整段Cookie到Playwright】 ======================
             cookie_str = read_cookie_from_folder(self.url)
-            #print(cookie_str)
             if cookie_str:
                 cookies = []
                 for part in cookie_str.split(";"):
@@ -196,7 +227,6 @@ class PWDownloadThread(QThread):
                         "httpOnly": False,
                         "secure": True
                     })
-                #print(cookies)
                 await context.add_cookies(cookies)
 
             # 关键：移除 playwright 自动化痕迹
@@ -259,6 +289,63 @@ class PWDownloadThread(QThread):
             self.progress_update.emit(self.filename, 100)
             self.finished_signal.emit(self.filename, final_path)
 
+class CookieFetcher(QThread):
+    cookie_updated = Signal(str)
+    error_occurred = Signal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=False)
+                page = browser.new_page()
+                page.goto(self.url)
+
+                # 存储上次发送的cookie字符串，避免重复发送相同内容
+                last_cookie_str = ""
+
+                # 监听网络请求，实时获取cookie变化
+                def on_response(response):
+                    nonlocal last_cookie_str
+                    try:
+                        cookies = page.context.cookies()
+                        cookie_items = [f"{c['name']}={c['value']}" for c in cookies]
+                        cookie_str = ";".join(sorted(cookie_items))  # 排序确保一致性
+
+                        # 只有当cookie发生变化时才发送信号
+                        if cookie_str != last_cookie_str:
+                            last_cookie_str = cookie_str
+                            self.cookie_updated.emit(cookie_str or "[空]")
+                    except:
+                        pass  # 忽略可能的异常
+
+                page.on("response", on_response)
+
+                # 持续监听直到用户手动关闭浏览器
+                while True:
+                    try:
+                        # 每隔一段时间主动检查一次cookies
+                        time.sleep(2)
+                        cookies = page.context.cookies()
+                        cookie_items = [f"{c['name']}={c['value']}" for c in cookies]
+                        cookie_str = "\n".join(sorted(cookie_items))
+
+                        if cookie_str != last_cookie_str:
+                            last_cookie_str = cookie_str
+                            self.cookie_updated.emit(cookie_str or "[空]")
+
+                        # 检查页面是否仍然存在
+                        page.title()
+                    except:
+                        break  # 页面关闭或出错时退出循环
+
+                browser.close()
+                #self.cookie_updated.emit("[浏览器已关闭]")  # 发送浏览器关闭通知
+        except Exception as e:
+            self.error_occurred.emit(str(e))
 
 # ====================== Cookie设置弹窗 ======================
 class CookieSettingDialog(QDialog):
@@ -393,6 +480,7 @@ class VideoDownloader(QMainWindow):
         self.setGeometry(100, 100, 1200, 700)
         self.save_path = os.getcwd()
         self.download_tasks = {}
+        self.cookie_fetcher = None
 
         # 主布局
         central_widget = QWidget()
@@ -408,17 +496,34 @@ class VideoDownloader(QMainWindow):
         # 地址栏
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("输入视频链接...")
-        self.start_btn = QPushButton("开始")
+        self.start_btn = QPushButton("开始下载")
         self.start_btn.clicked.connect(self.start_download)
-
-        # Cookie设置按钮
-        self.cookie_btn = QPushButton("Cookie设置")
-        self.cookie_btn.clicked.connect(self.open_cookie_setting)
 
         top_tool_layout.addWidget(self.url_input)
         top_tool_layout.addWidget(self.start_btn)
-        top_tool_layout.addWidget(self.cookie_btn)
         left_layout.addLayout(top_tool_layout)
+
+        # 顶部工具栏（新增Cookie按钮）
+        top_cookie_layout = QHBoxLayout()
+
+        # 获取cookie
+        self.cookie_input = QTextEdit()
+        self.cookie_input.setFixedSize(500, 30)
+        self.get_cookie_btn = QPushButton("获取Cookie")
+        self.get_cookie_btn.setFixedWidth(100)
+        self.get_cookie_btn.clicked.connect(self.on_fetch_cookie)
+
+        # 获取cookie
+        self.save_cookie_button = QPushButton("保存")
+        self.save_cookie_button.setFixedWidth(100)
+        self.save_cookie_button.clicked.connect(self.on_save_cookie)
+
+        top_cookie_layout.addWidget(self.cookie_input)
+        top_cookie_layout.addWidget(self.get_cookie_btn)
+        top_cookie_layout.addWidget(self.save_cookie_button)
+        top_cookie_layout.addStretch()
+        left_layout.addLayout(top_cookie_layout)
+
 
         # 网页预览
         self.web_view = QWebEngineView()
@@ -431,7 +536,18 @@ class VideoDownloader(QMainWindow):
         self.path_btn.clicked.connect(self.select_save_path)
         path_layout.addWidget(self.path_label)
         path_layout.addWidget(self.path_btn)
+        path_layout.addStretch()
         left_layout.addLayout(path_layout)
+
+        # 设置cookie
+        cookie_layout = QHBoxLayout()
+        self.cookie_btn = QPushButton("Cookie设置")
+        self.cookie_btn.setFixedWidth(100)
+        self.cookie_btn.clicked.connect(self.open_cookie_setting)
+        cookie_layout.addWidget(self.cookie_btn)
+        cookie_layout.addStretch()
+        left_layout.addLayout(cookie_layout)
+
 
         # 下载列表
         right_layout.addWidget(QLabel("下载列表"))
@@ -443,6 +559,53 @@ class VideoDownloader(QMainWindow):
 
         main_layout.addLayout(left_layout, stretch=3)
         main_layout.addLayout(right_layout, stretch=1)
+
+    def on_fetch_cookie(self):
+        url = self.url_input.text().strip()
+        if not url:
+            self.cookie_input.setText("[错误] 请先填写有效的URL地址！")
+            return
+
+        self.cookie_input.setText("正在启动浏览器并获取Cookie，请稍候...")
+        self.cookie_fetcher = CookieFetcher(url)
+        self.cookie_fetcher.cookie_updated.connect(self.update_cookie_display)
+        self.cookie_fetcher.error_occurred.connect(self.handle_error)
+        self.cookie_fetcher.start()
+
+    def update_cookie_display(self, cookie_str):
+        # 清除旧信息，显示最新cookie
+        self.cookie_input.setText(cookie_str)
+
+    def handle_error(self, error_msg):
+        self.cookie_input.setText(f"[异常发生]: {error_msg}")
+
+
+    def on_save_cookie(self):
+        domain = self.extract_domain_from_url(self.url_input.text())
+        content = self.cookie_input.toPlainText()
+        if not domain or not content.strip() or "[错误]" in content or "[异常发生]" in content or "[浏览器已关闭]" in content:
+            QMessageBox.warning(self, "保存失败", "无法提取域名或无有效内容可保存")
+            return
+        try:
+            #file_path = f"{domain}.txt"
+            file_path = os.path.join(COOKIE_DIR, f"{domain}.txt")
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            QMessageBox.information(self, "保存成功", f"已将Cookie写入文件: {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"保存文件时发生错误: {str(e)}")
+
+    @staticmethod
+    def extract_domain_from_url(url):
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url)
+            netloc = parsed.netloc
+            if ':' in netloc:
+                netloc = netloc.split(':')[0]
+            return netloc.replace("www.", "") if netloc else ""
+        except:
+            return ""
 
     def open_cookie_setting(self):
         """打开Cookie设置弹窗"""
